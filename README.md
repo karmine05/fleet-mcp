@@ -1,24 +1,20 @@
-
-🔗 **GitHub Repo:** [Insert Repo Link Here]
-🔗 **Learn about MCP:** https://modelcontextprotocol.io/
-🔗 **Learn about Fleet:** https://fleetdm.com/
-
-#DevSecOps #CyberSecurity #AI #ModelContextProtocol #FleetDM #OSQuery #GoLang #OpenSource
-
----
-
-## 3. Updated README.md (Option A)
-
-```md
 # Fleet MCP Server 🚀
 
 A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server for the [Fleet](https://fleetdm.com) endpoint security platform.
 
 **Transform how you interact with your endpoint data. Query OSQuery, check compliance, and investigate CVEs natively from Claude, Cursor, and any MCP-compatible AI agent.**
 
+🔗 **GitHub Repo:** [https://github.com/karmine05/fleet-mcp](https://github.com/karmine05/fleet-mcp)
+🔗 **Learn about MCP:** [https://modelcontextprotocol.io/](https://modelcontextprotocol.io/)
+🔗 **Learn about Fleet:** [https://fleetdm.com/](https://fleetdm.com/)
+
+#DevSecOps #CyberSecurity #AI #ModelContextProtocol #FleetDM #OSQuery #GoLang #OpenSource
+
+---
+
 ## 📺 See it in Action
 
-Watch our 2-minute walkthrough demonstrating how to use Claude Desktop to instantly write and run live OSQueries across your fleet.
+Watch 1 hr long walkthrough demonstrating how to use Claude Desktop to instantly write and run live OSQueries across your fleet.
 
 [![Fleet MCP Walkthrough Demo](https://img.youtube.com/vi/8K77litllPk/maxresdefault.jpg)](https://www.youtube.com/watch?v=8K77litllPk)
 
@@ -62,10 +58,10 @@ Configure the server using environment variables or a `.env` file.
 
 Copy the provided example to get started:
 
-\`\`\`bash
+```bash
 cp .env.example .env
 # Edit .env with your Fleet URL and API key
-\`\`\`
+```
 
 ## Installation
 
@@ -76,12 +72,12 @@ cp .env.example .env
 
 ### Build
 
-\`\`\`bash
-git clone https://github.com/your-org/fleet-mcp.git
+```bash
+git clone https://github.com/karmine05/fleet-mcp.git
 cd fleet-mcp
 go mod tidy
 go build -o fleet-mcp .
-\`\`\`
+```
 
 ## Usage
 
@@ -89,16 +85,16 @@ go build -o fleet-mcp .
 
 Start the server — it will listen for SSE connections:
 
-\`\`\`bash
+```bash
 ./fleet-mcp
 # Listening on :8080/sse
-\`\`\`
+```
 
 Configure your MCP client to connect to `http://localhost:8080/sse`.
 
 For **Claude Code**, add to your project's `.mcp.json` or global MCP config:
 
-\`\`\`json
+```json
 {
   "mcpServers": {
     "fleet": {
@@ -107,7 +103,7 @@ For **Claude Code**, add to your project's `.mcp.json` or global MCP config:
     }
   }
 }
-\`\`\`
+```
 
 ### Stdio Transport (Claude Desktop)
 
@@ -116,7 +112,7 @@ Stdio mode runs the binary directly as a subprocess with no network port needed.
 1. Build the binary: `go build -o fleet-mcp .`
 2. Edit `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS):
 
-\`\`\`json
+```json
 {
   "mcpServers": {
     "fleet": {
@@ -130,7 +126,7 @@ Stdio mode runs the binary directly as a subprocess with no network port needed.
     }
   }
 }
-\`\`\`
+```
 
 3. Relaunch Claude Desktop. The Fleet tools will appear in your context.
 
@@ -144,4 +140,3 @@ Stdio mode runs the binary directly as a subprocess with no network port needed.
 ## License
 
 MIT
-```
