@@ -1,17 +1,2 @@
-# Binaries
+fleet
 fleet-mcp
-fleet-mcp-debug
-*.exe
-*.out
-
-# Environment — never commit secrets
-.env
-
-# Build artifacts / temp
-tmp/
-.gocache/
-.gotmp/
-*.log
-
-# macOS
-.DS_Store
