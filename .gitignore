@@ -1,2 +1,9 @@
 fleet
 fleet-mcp
+
+# claude
+.claude*
+.swarm*
+ruvector.db
+CLAUDE.md
+.mcp.json
