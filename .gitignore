@@ -1,9 +1,51 @@
+# OS Files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Go Build Artifacts
 fleet
 fleet-mcp
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+go.work
 
-# claude
-.claude*
-.swarm*
-ruvector.db
+# AI / Agent Files & Databases
 CLAUDE.md
-.mcp.json
+.claude/
+.claude-flow/
+.swarm/
+agentdb.rvf
+agentdb.rvf.lock
+ruvector.db
+.mcp.*
+.cursor/
+.copilot/
+.antigravity/
+
+# Environment Variables & Secrets
+.env
+.env.*
+!.env.example
+!.env.test
+*.pem
+*.key
+
+# IDEs & Editors
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp
+*~
