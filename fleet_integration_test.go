@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -297,16 +298,16 @@ func TestValidateCVEID(t *testing.T) {
 		wantErr bool
 	}{
 		{"CVE-2026-12345", false},
-		{"CVE-1999-0001", false},     // 4-digit minimum
+		{"CVE-1999-0001", false},      // 4-digit minimum
 		{"  CVE-2026-12345  ", false}, // trims
 		{"", true},
 		{"   ", true},
-		{"cve-2026-12345", true},   // case-sensitive
-		{"CVE-26-12345", true},     // year too short
-		{"CVE-2026-123", true},     // suffix too short
-		{"CVE-2026-12345x", true},  // trailing junk
-		{"CVE-2026", true},         // missing suffix
-		{"<script>", true},         // injection-shaped junk
+		{"cve-2026-12345", true},  // case-sensitive
+		{"CVE-26-12345", true},    // year too short
+		{"CVE-2026-123", true},    // suffix too short
+		{"CVE-2026-12345x", true}, // trailing junk
+		{"CVE-2026", true},        // missing suffix
+		{"<script>", true},        // injection-shaped junk
 	}
 	for _, tc := range cases {
 		t.Run(tc.in, func(t *testing.T) {
@@ -345,6 +346,248 @@ func TestParsePositiveUintString(t *testing.T) {
 				t.Errorf("n=%d, want %d", n, tc.wantN)
 			}
 		})
+	}
+}
+
+func TestListSoftwareTitles_PaginatesUntilShortPage(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/fleet/software/titles" {
+			t.Errorf("unexpected path %q", r.URL.Path)
+			http.NotFound(w, r)
+			return
+		}
+		calls.Add(1)
+		page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+		var titles []SoftwareTitle
+		switch page {
+		case 0:
+			titles = make([]SoftwareTitle, 100)
+			for i := range titles {
+				titles[i] = SoftwareTitle{ID: uint(i + 1), Name: fmt.Sprintf("pkg%d", i), Source: "apps"}
+			}
+		case 1:
+			titles = make([]SoftwareTitle, 25)
+			for i := range titles {
+				titles[i] = SoftwareTitle{ID: uint(100 + i + 1), Name: fmt.Sprintf("pkg%d", 100+i), Source: "apps"}
+			}
+		default:
+			t.Errorf("unexpected page %d", page)
+			http.Error(w, "unexpected page", http.StatusBadRequest)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(struct {
+			SoftwareTitles []SoftwareTitle `json:"software_titles"`
+		}{SoftwareTitles: titles})
+	}))
+	defer srv.Close()
+
+	fc := newTestClient(srv.URL)
+	// perPage 0 means "no client-side cap" — paginate until the short page.
+	out, truncated, err := fc.ListSoftwareTitles(context.Background(), "", "", "", "", "", 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if truncated {
+		t.Errorf("expected truncated=false")
+	}
+	if got, want := len(out), 125; got != want {
+		t.Errorf("len(out) = %d, want %d", got, want)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Errorf("expected 2 page calls, got %d", got)
+	}
+}
+
+func TestListSoftwareTitles_AppliesSourceFilter(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/fleet/software/titles" {
+			http.NotFound(w, r)
+			return
+		}
+		page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+		if page > 0 {
+			// Short page on page 1 to end pagination.
+			_ = json.NewEncoder(w).Encode(struct {
+				SoftwareTitles []SoftwareTitle `json:"software_titles"`
+			}{})
+			return
+		}
+		// Mixed-source payload: 3 npm, 2 python, 5 apps. Short page (8 < 100)
+		// so pagination ends after this response.
+		titles := []SoftwareTitle{
+			{ID: 1, Name: "left-pad", Source: "npm_packages"},
+			{ID: 2, Name: "lodash", Source: "npm_packages"},
+			{ID: 3, Name: "axios", Source: "npm_packages"},
+			{ID: 4, Name: "requests", Source: "python_packages"},
+			{ID: 5, Name: "numpy", Source: "python_packages"},
+			{ID: 6, Name: "Slack.app", Source: "apps"},
+			{ID: 7, Name: "Chrome.app", Source: "apps"},
+			{ID: 8, Name: "Zoom.app", Source: "apps"},
+		}
+		_ = json.NewEncoder(w).Encode(struct {
+			SoftwareTitles []SoftwareTitle `json:"software_titles"`
+		}{SoftwareTitles: titles})
+	}))
+	defer srv.Close()
+
+	fc := newTestClient(srv.URL)
+	out, _, err := fc.ListSoftwareTitles(context.Background(), "", "", "", "", "npm_packages", 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got, want := len(out), 3; got != want {
+		t.Errorf("len(out) = %d, want %d (3 npm)", got, want)
+	}
+	for _, row := range out {
+		if !strings.EqualFold(row.Source, "npm_packages") {
+			t.Errorf("unexpected source %q in filtered result", row.Source)
+		}
+	}
+
+	// Case-insensitive should also work.
+	out2, _, err := fc.ListSoftwareTitles(context.Background(), "", "", "", "", "NPM_PACKAGES", 0)
+	if err != nil {
+		t.Fatalf("unexpected error (case-insensitive): %v", err)
+	}
+	if len(out2) != 3 {
+		t.Errorf("case-insensitive filter returned %d rows, want 3", len(out2))
+	}
+}
+
+func TestGetHostSoftware_PropagatesTruncated(t *testing.T) {
+	// Lower the cap so a small fixture trips truncation deterministically.
+	orig := fetchSoftwareHardCap
+	fetchSoftwareHardCap = 4
+	t.Cleanup(func() { fetchSoftwareHardCap = orig })
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.URL.Path, "/api/v1/fleet/hosts/") || !strings.HasSuffix(r.URL.Path, "/software") {
+			http.NotFound(w, r)
+			return
+		}
+		// Single page with 10 matching rows — hard cap of 4 should fire
+		// before the page is fully consumed.
+		rows := make([]HostSoftware, 10)
+		for i := range rows {
+			rows[i] = HostSoftware{ID: uint(i + 1), Name: fmt.Sprintf("pkg%d", i), Source: "apps"}
+		}
+		_ = json.NewEncoder(w).Encode(struct {
+			Software []HostSoftware `json:"software"`
+		}{Software: rows})
+	}))
+	defer srv.Close()
+
+	fc := newTestClient(srv.URL)
+	// perPage 0 — don't short-circuit on client-side cap. Force the hard-cap
+	// path to fire instead. source="" matches everything.
+	out, truncated, err := fc.GetHostSoftware(context.Background(), 42, "", "", "", 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !truncated {
+		t.Errorf("expected truncated=true when hard cap fires")
+	}
+	if got, want := len(out), 4; got != want {
+		t.Errorf("len(out) = %d, want %d (hard cap)", got, want)
+	}
+}
+
+func TestResolveHostWithUsers_AmbiguousCandidates(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/api/v1/fleet/hosts":
+			// Substring search returns multiple collisions.
+			hosts := []Endpoint{
+				{ID: 1, Name: "mac-1.local"},
+				{ID: 2, Name: "mac-2.local"},
+				{ID: 3, Name: "mac-3.local"},
+			}
+			_ = json.NewEncoder(w).Encode(struct {
+				Hosts []Endpoint `json:"hosts"`
+			}{Hosts: hosts})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	fc := newTestClient(srv.URL)
+	host, ambiguous, candidates, err := resolveHostWithUsers(context.Background(), fc, "", "mac")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !ambiguous {
+		t.Errorf("expected ambiguous=true for multi-match identifier")
+	}
+	if host != nil {
+		t.Errorf("expected host=nil when ambiguous, got %+v", host)
+	}
+	if got, want := len(candidates), 3; got != want {
+		t.Errorf("len(candidates) = %d, want %d", got, want)
+	}
+}
+
+func TestGetHostByIDWithUsers_DecodesUsers(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/fleet/hosts/42" {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"host": map[string]any{
+				"id":       42,
+				"hostname": "test.local",
+				"users": []map[string]any{
+					{"uid": "501", "username": "alice", "type": "regular", "groupname": "staff", "shell": "/bin/zsh"},
+					{"uid": "502", "username": "bob", "type": "regular", "groupname": "staff", "shell": "/bin/bash"},
+				},
+			},
+		})
+	}))
+	defer srv.Close()
+
+	fc := newTestClient(srv.URL)
+	host, err := fc.GetHostByIDWithUsers(context.Background(), 42)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if host == nil {
+		t.Fatalf("nil host")
+	}
+	if got, want := host.ID, uint(42); got != want {
+		t.Errorf("host.ID = %d, want %d", got, want)
+	}
+	if got, want := len(host.Users), 2; got != want {
+		t.Errorf("len(users) = %d, want %d", got, want)
+	}
+	if host.Users[0].Username != "alice" || host.Users[1].Shell != "/bin/bash" {
+		t.Errorf("user decode mismatch: %+v", host.Users)
+	}
+}
+
+func TestFilterHostUsers_CaseInsensitiveAcrossFields(t *testing.T) {
+	users := []HostUser{
+		{UID: "501", Username: "alice", GroupName: "staff", Shell: "/bin/zsh"},
+		{UID: "502", Username: "bob", GroupName: "wheel", Shell: "/bin/bash"},
+		{UID: "0", Username: "root", GroupName: "wheel", Shell: "/bin/sh"},
+	}
+	cases := []struct {
+		query string
+		want  int
+	}{
+		{"alice", 1}, // username exact
+		{"ALICE", 1}, // case-insensitive
+		{"wheel", 2}, // groupname
+		{"bash", 1},  // shell
+		{"50", 2},    // uid prefix (matches 501, 502)
+		{"nomatch", 0},
+	}
+	for _, tc := range cases {
+		got := filterHostUsers(users, tc.query)
+		if len(got) != tc.want {
+			t.Errorf("filterHostUsers(%q) returned %d, want %d", tc.query, len(got), tc.want)
+		}
 	}
 }
 

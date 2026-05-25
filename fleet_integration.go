@@ -225,6 +225,81 @@ type HostWithPolicies struct {
 	Policies []HostPolicyEntry `json:"policies"`
 }
 
+// HostUser is one OS-local account inventoried by osquery and returned inline
+// on Fleet's host detail endpoint. Fleet refreshes this on each host check-in,
+// so it's available even when the host is currently offline. Fields mirror the
+// columns from osquery's `users` table (uid, username, type, groupname, shell).
+type HostUser struct {
+	UID       string `json:"uid"`
+	Username  string `json:"username"`
+	Type      string `json:"type"`
+	GroupName string `json:"groupname"`
+	Shell     string `json:"shell"`
+}
+
+// HostWithUsers is a host listing enriched with the inline `users` array Fleet
+// returns from /api/v1/fleet/hosts/:id and /api/v1/fleet/hosts/identifier/:id.
+// Same backward-compatibility shape as HostWithPolicies: Endpoint fields stay
+// at the top level, users[] is additive.
+type HostWithUsers struct {
+	Endpoint
+	Users []HostUser `json:"users"`
+}
+
+// SoftwareVulnerability is one CVE attached to a software title or version.
+// Fleet returns nested CVE entries with optional CVSS/EPSS scoring depending
+// on Fleet tier; we decode only the fields the MCP exposes.
+type SoftwareVulnerability struct {
+	CVE              string   `json:"cve"`
+	DetailsLink      string   `json:"details_link,omitempty"`
+	CVSSScore        *float64 `json:"cvss_score,omitempty"`
+	EPSSProbability  *float64 `json:"epss_probability,omitempty"`
+	CISAKnownExploit *bool    `json:"cisa_known_exploit,omitempty"`
+}
+
+// SoftwareVersion is one installed version under a SoftwareTitle when listing
+// titles via /api/v1/fleet/software/titles. Vulnerabilities decode into the
+// nested array; Fleet sometimes returns a flat []string of CVE IDs instead of
+// the object form, so the decoder leaves the field permissive via interface{}.
+type SoftwareVersion struct {
+	ID              uint            `json:"id"`
+	Version         string          `json:"version"`
+	Vulnerabilities json.RawMessage `json:"vulnerabilities,omitempty"`
+}
+
+// SoftwareTitle is one cross-host software entry returned from
+// /api/v1/fleet/software/titles. `Source` is the osquery source table the row
+// originated from (e.g. "apps", "deb_packages", "npm_packages", "python_packages",
+// "chrome_extensions", "vscode_extensions", "homebrew_packages") and is the
+// field clients filter on client-side to narrow by package ecosystem.
+type SoftwareTitle struct {
+	ID               uint              `json:"id"`
+	Name             string            `json:"name"`
+	Source           string            `json:"source"`
+	VersionsCount    int               `json:"versions_count"`
+	HostsCount       int               `json:"hosts_count"`
+	Versions         []SoftwareVersion `json:"versions,omitempty"`
+	BundleIdentifier string            `json:"bundle_identifier,omitempty"`
+	Browser          string            `json:"browser,omitempty"`
+	ExtensionFor     string            `json:"extension_for,omitempty"`
+}
+
+// HostSoftware is one row from /api/v1/fleet/hosts/:id/software representing
+// a single (title, version) installation on the host. Same `source` filtering
+// rules as SoftwareTitle. `installed_paths` is populated where osquery can
+// determine the on-disk install location.
+type HostSoftware struct {
+	ID               uint            `json:"id"`
+	Name             string          `json:"name"`
+	Version          string          `json:"version"`
+	Source           string          `json:"source"`
+	BundleIdentifier string          `json:"bundle_identifier,omitempty"`
+	Vulnerabilities  json.RawMessage `json:"vulnerabilities,omitempty"`
+	InstalledPaths   []string        `json:"installed_paths,omitempty"`
+	LastOpenedAt     string          `json:"last_opened_at,omitempty"`
+	Browser          string          `json:"browser,omitempty"`
+}
+
 // Team represents a Fleet team
 type Team struct {
 	ID          uint   `json:"id"`
@@ -471,6 +546,251 @@ func (fc *FleetClient) GetHostByIdentifierWithPolicies(ctx context.Context, iden
 		return nil, fmt.Errorf("failed to decode host with policies response: %w", err)
 	}
 	return &result.Host, nil
+}
+
+// GetHostByIDWithUsers fetches a host by numeric ID together with the inline
+// users[] array (OS-local accounts inventoried by osquery). Same disambiguation
+// guarantee as GetHostByID — :host_id never collides on shared hostnames.
+func (fc *FleetClient) GetHostByIDWithUsers(ctx context.Context, hostID uint) (*HostWithUsers, error) {
+	endpointPath := fmt.Sprintf("/api/v1/fleet/hosts/%d", hostID)
+	resp, err := fc.makeFleetRequest(ctx, "GET", endpointPath, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get host with users by id: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, fmt.Errorf("host not found: id=%d", hostID)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("failed to get host with users by id: status code %d", resp.StatusCode)
+	}
+
+	var result struct {
+		Host HostWithUsers `json:"host"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("failed to decode host with users by id response: %w", err)
+	}
+	return &result.Host, nil
+}
+
+// GetHostByIdentifierWithUsers fetches a host's full details together with the
+// inline users[] array via /api/v1/fleet/hosts/identifier/:identifier. Mirrors
+// the disambiguation behavior of GetHostByIdentifier — Fleet's substring
+// matcher silently returns ONE host when multiple share a hostname, so callers
+// using this method directly should fall back to query-first disambiguation
+// for ambiguity-prone identifiers (see resolveHostWithUsers in
+// mcp_tools_inventory.go).
+func (fc *FleetClient) GetHostByIdentifierWithUsers(ctx context.Context, identifier string) (*HostWithUsers, error) {
+	endpointPath := fmt.Sprintf("/api/v1/fleet/hosts/identifier/%s", url.PathEscape(identifier))
+	resp, err := fc.makeFleetRequest(ctx, "GET", endpointPath, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get host with users: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, fmt.Errorf("host not found: %s", identifier)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("failed to get host with users: status code %d", resp.StatusCode)
+	}
+
+	var result struct {
+		Host HostWithUsers `json:"host"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("failed to decode host with users response: %w", err)
+	}
+	return &result.Host, nil
+}
+
+// fetchSoftwareHardCap is the safety ceiling on a single paginated software
+// fetch (titles or per-host). Same rationale as fetchHostsHardCap — bound the
+// memory footprint of a single MCP call when a permissive filter or large
+// Fleet inventory returns far more rows than the caller will use.
+// var (not const) so tests can lower the cap without generating large fixtures.
+var fetchSoftwareHardCap = 5000
+
+// matchesSoftwareSource performs the case-insensitive `source` comparison used
+// to client-side filter HostSoftware and SoftwareTitle results. Empty `want`
+// is a no-op match (caller didn't filter).
+func matchesSoftwareSource(rowSource, want string) bool {
+	if want == "" {
+		return true
+	}
+	return strings.EqualFold(rowSource, want)
+}
+
+// GetHostSoftware paginates GET /api/v1/fleet/hosts/:id/software, applying the
+// caller's query/vulnerable filters server-side and the `source` filter
+// client-side (Fleet doesn't accept source as a server-side param here). Stops
+// when enough qualifying rows are collected (perPage), a short page is
+// returned (last page), or fetchSoftwareHardCap is hit.
+//
+// `perPage` is the *client-visible* cap on the merged result; the underlying
+// API call is paginated at 500/page for fewer round-trips.
+func (fc *FleetClient) GetHostSoftware(ctx context.Context, hostID uint, query, vulnerable, source string, perPage int) ([]HostSoftware, bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if hostID == 0 {
+		return nil, false, fmt.Errorf("host_id is required")
+	}
+
+	const apiPerPage = 500
+	out := make([]HostSoftware, 0, perPage)
+	truncated := false
+	for page := 0; ; page++ {
+		// Honor caller cancellation between paginated requests.
+		if err := ctx.Err(); err != nil {
+			return nil, false, err
+		}
+
+		params := url.Values{}
+		params.Set("per_page", strconv.Itoa(apiPerPage))
+		params.Set("page", strconv.Itoa(page))
+		if q := strings.TrimSpace(query); q != "" {
+			params.Set("query", q)
+		}
+		if v := strings.TrimSpace(vulnerable); v != "" {
+			params.Set("vulnerable", v)
+		}
+
+		endpointPath := fmt.Sprintf("/api/v1/fleet/hosts/%d/software?%s", hostID, params.Encode())
+		resp, err := fc.makeFleetRequest(ctx, "GET", endpointPath, nil)
+		if err != nil {
+			return nil, false, fmt.Errorf("failed to fetch host software: %w", err)
+		}
+		if resp.StatusCode == http.StatusNotFound {
+			resp.Body.Close()
+			return nil, false, fmt.Errorf("host not found: id=%d", hostID)
+		}
+		if resp.StatusCode != http.StatusOK {
+			status := resp.StatusCode
+			resp.Body.Close()
+			return nil, false, fmt.Errorf("failed to fetch host software: status %d", status)
+		}
+
+		var result struct {
+			Software []HostSoftware `json:"software"`
+		}
+		decErr := json.NewDecoder(resp.Body).Decode(&result)
+		resp.Body.Close()
+		if decErr != nil {
+			return nil, false, fmt.Errorf("failed to decode host software response: %w", decErr)
+		}
+
+		// Apply client-side source filter while merging — server can't filter
+		// by source on this endpoint.
+		shortPage := len(result.Software) < apiPerPage
+		for _, row := range result.Software {
+			if !matchesSoftwareSource(row.Source, source) {
+				continue
+			}
+			out = append(out, row)
+			if perPage > 0 && len(out) >= perPage {
+				return out, false, nil
+			}
+			if len(out) >= fetchSoftwareHardCap {
+				logrus.Warnf("host software fetch hit hard cap %d (host_id=%d) — result truncated; tighten filters or raise fetchSoftwareHardCap", fetchSoftwareHardCap, hostID)
+				return out, true, nil
+			}
+		}
+		if shortPage {
+			break
+		}
+	}
+	return out, truncated, nil
+}
+
+// ListSoftwareTitles paginates GET /api/v1/fleet/software/titles applying
+// team_id / platform / query / vulnerable server-side and the `source` filter
+// client-side. Resolves a team NAME (Fleet) via resolveTeamNames the same way
+// GetEndpointsWithFilters does — failures bubble up the available-fleet list.
+//
+// `platform` is passed through directly: Fleet maps macos→darwin server-side
+// on this endpoint, so we don't normalize here (unlike the hosts endpoint).
+// Stops on perPage, short page, or fetchSoftwareHardCap.
+func (fc *FleetClient) ListSoftwareTitles(ctx context.Context, teamName, platform, query, vulnerable, source string, perPage int) ([]SoftwareTitle, bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	// Resolve team name once (used as ?team_id= on every page).
+	var teamIDStr string
+	if teamName != "" {
+		teamIDs, err := fc.resolveTeamNames(ctx, []string{teamName})
+		if err != nil {
+			return nil, false, fmt.Errorf("failed to resolve fleet: %w", err)
+		}
+		teamIDStr = fmt.Sprintf("%d", teamIDs[0])
+	}
+
+	const apiPerPage = 100 // titles endpoint returns expanded objects; lower page size keeps payloads small
+	out := make([]SoftwareTitle, 0, perPage)
+	truncated := false
+	for page := 0; ; page++ {
+		// Honor caller cancellation between paginated requests.
+		if err := ctx.Err(); err != nil {
+			return nil, false, err
+		}
+
+		params := url.Values{}
+		params.Set("per_page", strconv.Itoa(apiPerPage))
+		params.Set("page", strconv.Itoa(page))
+		if teamIDStr != "" {
+			params.Set("team_id", teamIDStr)
+		}
+		if p := strings.TrimSpace(platform); p != "" {
+			params.Set("platform", p)
+		}
+		if q := strings.TrimSpace(query); q != "" {
+			params.Set("query", q)
+		}
+		if v := strings.TrimSpace(vulnerable); v != "" {
+			params.Set("vulnerable", v)
+		}
+
+		resp, err := fc.makeFleetRequest(ctx, "GET", "/api/v1/fleet/software/titles?"+params.Encode(), nil)
+		if err != nil {
+			return nil, false, fmt.Errorf("failed to fetch software titles: %w", err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			status := resp.StatusCode
+			resp.Body.Close()
+			return nil, false, fmt.Errorf("failed to fetch software titles: status %d", status)
+		}
+
+		var result struct {
+			SoftwareTitles []SoftwareTitle `json:"software_titles"`
+		}
+		decErr := json.NewDecoder(resp.Body).Decode(&result)
+		resp.Body.Close()
+		if decErr != nil {
+			return nil, false, fmt.Errorf("failed to decode software titles response: %w", decErr)
+		}
+
+		shortPage := len(result.SoftwareTitles) < apiPerPage
+		for _, row := range result.SoftwareTitles {
+			if !matchesSoftwareSource(row.Source, source) {
+				continue
+			}
+			out = append(out, row)
+			if perPage > 0 && len(out) >= perPage {
+				return out, false, nil
+			}
+			if len(out) >= fetchSoftwareHardCap {
+				logrus.Warnf("software titles fetch hit hard cap %d — result truncated; tighten filters or raise fetchSoftwareHardCap", fetchSoftwareHardCap)
+				return out, true, nil
+			}
+		}
+		if shortPage {
+			break
+		}
+	}
+	return out, truncated, nil
 }
 
 // GetQueries retrieves global and all team-specific queries from Fleet.

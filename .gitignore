@@ -24,14 +24,12 @@ CLAUDE.md
 .claude/
 .claude-flow/
 .swarm/
-agentdb.rvf
-agentdb.rvf.lock
-ruvector.db
 .mcp.*
-.cursor/
 .copilot/
 .antigravity/
-
+.planning/*
+.graphify-out*
+graphify-out/*
 # Environment Variables & Secrets
 .env
 .env.*
@@ -49,3 +47,6 @@ ruvector.db
 *.sln
 *.swp
 *~
+ruvector.db
+agentdb.rvf.lock
+agentdb.rvf
