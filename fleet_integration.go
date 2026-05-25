@@ -229,8 +229,14 @@ type HostWithPolicies struct {
 // on Fleet's host detail endpoint. Fleet refreshes this on each host check-in,
 // so it's available even when the host is currently offline. Fields mirror the
 // columns from osquery's `users` table (uid, username, type, groupname, shell).
+//
+// Fleet returns `uid` as a JSON number (matching its server-side
+// `server/fleet/hosts.go` HostUser{Uid uint}). Using uint64 here keeps the
+// decoder happy across macOS/Linux (numeric uids) and high-range Windows-style
+// values; the wire encoding stays a number so downstream consumers preserve
+// type fidelity.
 type HostUser struct {
-	UID       string `json:"uid"`
+	UID       uint64 `json:"uid"`
 	Username  string `json:"username"`
 	Type      string `json:"type"`
 	GroupName string `json:"groupname"`

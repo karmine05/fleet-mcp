@@ -270,13 +270,16 @@ func resolveHostWithUsers(ctx context.Context, fleetClient *FleetClient, hostIDA
 
 // filterHostUsers applies a case-insensitive substring filter to a host's
 // users[] across username / uid / groupname / shell. Returns a fresh slice;
-// the input is not mutated.
+// the input is not mutated. UID is uint64 in the struct (matches Fleet's wire
+// type) — stringified before comparison so callers can search by uid prefix
+// (e.g. "501").
 func filterHostUsers(users []HostUser, q string) []HostUser {
 	needle := strings.ToLower(q)
 	out := make([]HostUser, 0, len(users))
 	for _, u := range users {
+		uidStr := strconv.FormatUint(u.UID, 10)
 		if strings.Contains(strings.ToLower(u.Username), needle) ||
-			strings.Contains(strings.ToLower(u.UID), needle) ||
+			strings.Contains(uidStr, needle) ||
 			strings.Contains(strings.ToLower(u.GroupName), needle) ||
 			strings.Contains(strings.ToLower(u.Shell), needle) {
 			out = append(out, u)

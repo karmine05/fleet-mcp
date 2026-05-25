@@ -539,8 +539,8 @@ func TestGetHostByIDWithUsers_DecodesUsers(t *testing.T) {
 				"id":       42,
 				"hostname": "test.local",
 				"users": []map[string]any{
-					{"uid": "501", "username": "alice", "type": "regular", "groupname": "staff", "shell": "/bin/zsh"},
-					{"uid": "502", "username": "bob", "type": "regular", "groupname": "staff", "shell": "/bin/bash"},
+					{"uid": 501, "username": "alice", "type": "regular", "groupname": "staff", "shell": "/bin/zsh"},
+					{"uid": 502, "username": "bob", "type": "regular", "groupname": "staff", "shell": "/bin/bash"},
 				},
 			},
 		})
@@ -568,9 +568,9 @@ func TestGetHostByIDWithUsers_DecodesUsers(t *testing.T) {
 
 func TestFilterHostUsers_CaseInsensitiveAcrossFields(t *testing.T) {
 	users := []HostUser{
-		{UID: "501", Username: "alice", GroupName: "staff", Shell: "/bin/zsh"},
-		{UID: "502", Username: "bob", GroupName: "wheel", Shell: "/bin/bash"},
-		{UID: "0", Username: "root", GroupName: "wheel", Shell: "/bin/sh"},
+		{UID: 501, Username: "alice", GroupName: "staff", Shell: "/bin/zsh"},
+		{UID: 502, Username: "bob", GroupName: "wheel", Shell: "/bin/bash"},
+		{UID: 0, Username: "root", GroupName: "wheel", Shell: "/bin/sh"},
 	}
 	cases := []struct {
 		query string
