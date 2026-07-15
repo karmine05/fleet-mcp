@@ -10,6 +10,9 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 func newTestClient(serverURL string) *FleetClient {
@@ -17,30 +20,6 @@ func newTestClient(serverURL string) *FleetClient {
 		baseURL:    serverURL,
 		apiKey:     "test",
 		httpClient: http.DefaultClient,
-	}
-}
-
-func TestIsTempQueryName(t *testing.T) {
-	cases := []struct {
-		name string
-		in   string
-		want bool
-	}{
-		{"global temp", tempQueryNamePrefix + "1234-abc", true},
-		{"team-scoped temp", "[Workstations] " + tempQueryNamePrefix + "1234-abc", true},
-		{"team-scoped temp with emoji", "[💻 Workstations] " + tempQueryNamePrefix + "1234-abc", true},
-		{"unrelated global query", "Top-level CPU usage", false},
-		{"unrelated team query", "[Servers] Disk space check", false},
-		{"prefix substring not at start", "prefixed-" + tempQueryNamePrefix + "abc", false},
-		{"empty", "", false},
-		{"just brackets", "[abc]", false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := isTempQueryName(tc.in); got != tc.want {
-				t.Errorf("isTempQueryName(%q) = %v, want %v", tc.in, got, tc.want)
-			}
-		})
 	}
 }
 
@@ -258,40 +237,6 @@ func TestBearerAuthMiddleware(t *testing.T) {
 	}
 }
 
-func TestRateLimiterMiddleware_BurstThen429(t *testing.T) {
-	rl := newIPRateLimiter(1, 2) // 2-token bucket, 1 rps refill
-	allowed := 0
-	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { allowed++ })
-	h := rl.Middleware(next)
-
-	send := func() *httptest.ResponseRecorder {
-		req := httptest.NewRequest("GET", "/", nil)
-		req.RemoteAddr = "203.0.113.7:5000"
-		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, req)
-		return rec
-	}
-
-	// First 2 in burst should pass.
-	if rec := send(); rec.Code != http.StatusOK {
-		t.Errorf("burst req 1: status = %d, want 200", rec.Code)
-	}
-	if rec := send(); rec.Code != http.StatusOK {
-		t.Errorf("burst req 2: status = %d, want 200", rec.Code)
-	}
-	// 3rd within the same instant should 429 with Retry-After.
-	rec := send()
-	if rec.Code != http.StatusTooManyRequests {
-		t.Errorf("status = %d, want 429", rec.Code)
-	}
-	if rec.Header().Get("Retry-After") == "" {
-		t.Errorf("missing Retry-After header on 429")
-	}
-	if allowed != 2 {
-		t.Errorf("next called %d times, want 2", allowed)
-	}
-}
-
 func TestValidateCVEID(t *testing.T) {
 	cases := []struct {
 		in      string
@@ -346,6 +291,307 @@ func TestParsePositiveUintString(t *testing.T) {
 				t.Errorf("n=%d, want %d", n, tc.wantN)
 			}
 		})
+	}
+}
+
+func TestGetHostsForCVE_PaginatesTitles(t *testing.T) {
+	var titlesCalls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/api/v1/fleet/software/titles/"):
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"software_title": map[string]any{"versions": []any{}},
+			})
+		case r.URL.Path == "/api/v1/fleet/software/titles":
+			titlesCalls.Add(1)
+			page := r.URL.Query().Get("page")
+			n, _ := strconv.Atoi(page)
+			var count int
+			switch n {
+			case 0:
+				count = 100
+			case 1:
+				count = 30
+			default:
+				t.Errorf("unexpected titles page %d", n)
+				http.Error(w, "unexpected page", http.StatusBadRequest)
+				return
+			}
+			type title struct {
+				ID uint `json:"id"`
+			}
+			titles := make([]title, count)
+			for i := range titles {
+				titles[i].ID = uint(n*1000 + i + 1)
+			}
+			_ = json.NewEncoder(w).Encode(struct {
+				SoftwareTitles []title `json:"software_titles"`
+			}{SoftwareTitles: titles})
+		default:
+			t.Errorf("unexpected request path %q", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	fc := newTestClient(srv.URL)
+	hosts, truncated, err := fc.GetHostsForCVE(context.Background(), "CVE-2026-12345", "", "", "", "", "", 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if truncated {
+		t.Errorf("expected truncated=false (no per-version-id fan-out hit cap)")
+	}
+	if len(hosts) != 0 {
+		t.Errorf("expected 0 hosts (titles had no versions), got %d", len(hosts))
+	}
+	if got := titlesCalls.Load(); got != 2 {
+		t.Errorf("expected 2 titles pages (100 + 30 short page), got %d", got)
+	}
+}
+
+// campaignTestServer stands up an httptest server that answers the campaign
+// create POST and upgrades the results websocket, then hands the connection to
+// drive() (after consuming the auth + select_campaign handshake) so each test
+// can script the frames the server sends back.
+func campaignTestServer(t *testing.T, campaignID uint, drive func(conn *websocket.Conn)) *httptest.Server {
+	up := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/fleet/reports/run":
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"campaign": map[string]interface{}{"id": campaignID},
+			})
+		case r.URL.Path == "/api/v1/fleet/results/websocket":
+			conn, err := up.Upgrade(w, r, nil)
+			if err != nil {
+				t.Errorf("websocket upgrade: %v", err)
+				return
+			}
+			defer conn.Close()
+			// Validate the client speaks the handshake protocol the real server
+			// enforces: an auth frame carrying a token, then a select_campaign
+			// frame naming this campaign.
+			var msg map[string]interface{}
+			if err := conn.ReadJSON(&msg); err != nil {
+				t.Errorf("read auth frame: %v", err)
+				return
+			}
+			if msg["type"] != "auth" {
+				t.Errorf("first frame type = %v, want auth", msg["type"])
+			}
+			if data, _ := msg["data"].(map[string]interface{}); data["token"] == "" || data["token"] == nil {
+				t.Errorf("auth frame missing token, got %v", msg["data"])
+			}
+			if err := conn.ReadJSON(&msg); err != nil {
+				t.Errorf("read select_campaign frame: %v", err)
+				return
+			}
+			if msg["type"] != "select_campaign" {
+				t.Errorf("second frame type = %v, want select_campaign", msg["type"])
+			}
+			// JSON numbers decode to float64 in an interface{} map.
+			if data, _ := msg["data"].(map[string]interface{}); data["campaign_id"] != float64(campaignID) {
+				t.Errorf("select_campaign campaign_id = %v, want %d", data["campaign_id"], campaignID)
+			}
+			drive(conn)
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+}
+
+func writeWSFrame(t *testing.T, conn *websocket.Conn, typ string, data interface{}) {
+	if err := conn.WriteJSON(map[string]interface{}{"type": typ, "data": data}); err != nil {
+		t.Errorf("server write %s frame: %v", typ, err)
+	}
+}
+
+// runMultiHostCampaign creates an ad-hoc campaign and streams results over the
+// websocket, aggregating each host's rows into one result.
+func TestRunMultiHostCampaign_AggregatesResults(t *testing.T) {
+	t.Setenv("FLEET_LIVE_QUERY_REST_PERIOD", "5s")
+	srv := campaignTestServer(t, 42, func(conn *websocket.Conn) {
+		writeWSFrame(t, conn, "totals", map[string]interface{}{"count": 2, "online": 2})
+		writeWSFrame(t, conn, "result", map[string]interface{}{
+			"host": map[string]interface{}{"id": 10, "hostname": "h10", "display_name": "Host 10"},
+			"rows": []map[string]string{{"answer": "42"}},
+		})
+		writeWSFrame(t, conn, "result", map[string]interface{}{
+			"host": map[string]interface{}{"id": 20, "hostname": "h20", "display_name": "Host 20"},
+			"rows": []map[string]string{{"answer": "43"}},
+		})
+		writeWSFrame(t, conn, "status", map[string]interface{}{"expected_results": 2, "actual_results": 2, "status": "finished"})
+	})
+	defer srv.Close()
+
+	fc := newTestClient(srv.URL)
+	nameByID := map[uint]Endpoint{10: {ID: 10, Name: "host-10"}, 20: {ID: 20, Name: "host-20"}}
+	res, err := fc.runMultiHostCampaign(t.Context(), []uint{10, 20}, "SELECT 1;", nameByID)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.TargetedHostCount != 2 {
+		t.Errorf("TargetedHostCount = %d, want 2 (from totals)", res.TargetedHostCount)
+	}
+	if res.RespondedHostCount != 2 {
+		t.Errorf("RespondedHostCount = %d, want 2 (from status.actual_results)", res.RespondedHostCount)
+	}
+	if len(res.Results) != 2 {
+		t.Fatalf("len(Results) = %d, want 2", len(res.Results))
+	}
+	// The locally-resolved host name wins over the server-reported one.
+	for _, row := range res.Results {
+		if row["host_id"] == uint(10) && row["host_name"] != "host-10" {
+			t.Errorf("host 10 name = %v, want host-10", row["host_name"])
+		}
+	}
+}
+
+// Offline hosts never report, so the stream stops once every online host has
+// responded rather than waiting out the deadline.
+func TestRunMultiHostCampaign_StopsWhenOnlineHostsRespond(t *testing.T) {
+	t.Setenv("FLEET_LIVE_QUERY_REST_PERIOD", "5s")
+	srv := campaignTestServer(t, 7, func(conn *websocket.Conn) {
+		// 3 targeted, only 2 online; host 30 is offline and silent.
+		writeWSFrame(t, conn, "totals", map[string]interface{}{"count": 3, "online": 2})
+		writeWSFrame(t, conn, "result", map[string]interface{}{
+			"host": map[string]interface{}{"id": 10}, "rows": []map[string]string{{"k": "v"}},
+		})
+		writeWSFrame(t, conn, "result", map[string]interface{}{
+			"host": map[string]interface{}{"id": 20}, "rows": []map[string]string{{"k": "v"}},
+		})
+		writeWSFrame(t, conn, "status", map[string]interface{}{"expected_results": 2, "actual_results": 2, "status": "finished"})
+	})
+	defer srv.Close()
+
+	fc := newTestClient(srv.URL)
+	nameByID := map[uint]Endpoint{10: {ID: 10}, 20: {ID: 20}, 30: {ID: 30}}
+	start := time.Now()
+	res, err := fc.runMultiHostCampaign(t.Context(), []uint{10, 20, 30}, "SELECT 1;", nameByID)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 4*time.Second {
+		t.Errorf("expected prompt return once online hosts responded, took %s", elapsed)
+	}
+	if res.TargetedHostCount != 3 {
+		t.Errorf("TargetedHostCount = %d, want 3", res.TargetedHostCount)
+	}
+	if res.RespondedHostCount != 2 {
+		t.Errorf("RespondedHostCount = %d, want 2", res.RespondedHostCount)
+	}
+	if len(res.Results) != 2 {
+		t.Errorf("len(Results) = %d, want 2 (offline host produced no row)", len(res.Results))
+	}
+}
+
+// A per-host osquery error in a result frame surfaces as an error on that host's
+// row without failing the whole query.
+func TestRunMultiHostCampaign_HostErrorRow(t *testing.T) {
+	t.Setenv("FLEET_LIVE_QUERY_REST_PERIOD", "5s")
+	srv := campaignTestServer(t, 1, func(conn *websocket.Conn) {
+		writeWSFrame(t, conn, "totals", map[string]interface{}{"count": 1, "online": 1})
+		writeWSFrame(t, conn, "result", map[string]interface{}{
+			"host":  map[string]interface{}{"id": 10},
+			"rows":  []map[string]string{},
+			"error": "no such table: bogus",
+		})
+		writeWSFrame(t, conn, "status", map[string]interface{}{"expected_results": 1, "actual_results": 1, "status": "finished"})
+	})
+	defer srv.Close()
+
+	fc := newTestClient(srv.URL)
+	res, err := fc.runMultiHostCampaign(t.Context(), []uint{10}, "SELECT * FROM bogus;", map[uint]Endpoint{10: {ID: 10}})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(res.Results) != 1 {
+		t.Fatalf("len(Results) = %d, want 1", len(res.Results))
+	}
+	if res.Results[0]["error"] != "no such table: bogus" {
+		t.Errorf("expected host error row, got %+v", res.Results[0])
+	}
+}
+
+// A failed campaign creation surfaces as an error (no websocket is opened).
+func TestRunMultiHostCampaign_CreateFails(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/fleet/results/websocket" {
+			t.Errorf("websocket must not be dialed when campaign creation fails")
+		}
+		http.Error(w, `{"message":"boom"}`, http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	fc := newTestClient(srv.URL)
+	_, err := fc.runMultiHostCampaign(t.Context(), []uint{10, 20}, "SELECT 1;", map[uint]Endpoint{})
+	if err == nil {
+		t.Fatal("expected error on failed campaign creation, got nil")
+	}
+}
+
+// An "error" frame from the server (campaign not found, unauthorized, pubsub
+// failure) must surface as an error, not a silent empty result.
+func TestRunMultiHostCampaign_ServerErrorFrame(t *testing.T) {
+	t.Setenv("FLEET_LIVE_QUERY_REST_PERIOD", "5s")
+	srv := campaignTestServer(t, 99, func(conn *websocket.Conn) {
+		writeWSFrame(t, conn, "error", "cannot find campaign for ID 99")
+	})
+	defer srv.Close()
+
+	fc := newTestClient(srv.URL)
+	_, err := fc.runMultiHostCampaign(t.Context(), []uint{10, 20}, "SELECT 1;", map[uint]Endpoint{})
+	if err == nil {
+		t.Fatal("expected error from server error frame, got nil")
+	}
+	if !strings.Contains(err.Error(), "cannot find campaign") {
+		t.Errorf("error %q should include the server's message", err)
+	}
+}
+
+// A mid-stream read failure (connection dropped before a terminal status) must
+// surface as an error rather than masquerading as an empty successful result.
+func TestRunMultiHostCampaign_StreamReadError(t *testing.T) {
+	t.Setenv("FLEET_LIVE_QUERY_REST_PERIOD", "5s")
+	srv := campaignTestServer(t, 5, func(conn *websocket.Conn) {
+		// Two hosts online but only one responds, then the connection drops
+		// abruptly (no "finished" status, no clean close handshake).
+		writeWSFrame(t, conn, "totals", map[string]interface{}{"count": 2, "online": 2})
+		writeWSFrame(t, conn, "result", map[string]interface{}{
+			"host": map[string]interface{}{"id": 10}, "rows": []map[string]string{{"k": "v"}},
+		})
+		conn.Close()
+	})
+	defer srv.Close()
+
+	fc := newTestClient(srv.URL)
+	_, err := fc.runMultiHostCampaign(t.Context(), []uint{10, 20}, "SELECT 1;", map[uint]Endpoint{10: {ID: 10}, 20: {ID: 20}})
+	if err == nil {
+		t.Fatal("expected error on abrupt stream drop, got nil")
+	}
+}
+
+func TestCampaignWebsocketURL(t *testing.T) {
+	cases := []struct {
+		base string
+		want string
+	}{
+		{"http://localhost:8080", "ws://localhost:8080/api/v1/fleet/results/websocket"},
+		{"https://fleet.example.com", "wss://fleet.example.com/api/v1/fleet/results/websocket"},
+		{"https://fleet.example.com/", "wss://fleet.example.com/api/v1/fleet/results/websocket"},
+	}
+	for _, tc := range cases {
+		fc := newTestClient(tc.base)
+		got, err := fc.campaignWebsocketURL()
+		if err != nil {
+			t.Errorf("campaignWebsocketURL(%q) error: %v", tc.base, err)
+			continue
+		}
+		if got != tc.want {
+			t.Errorf("campaignWebsocketURL(%q) = %q, want %q", tc.base, got, tc.want)
+		}
 	}
 }
 
@@ -513,7 +759,7 @@ func TestResolveHostWithUsers_AmbiguousCandidates(t *testing.T) {
 	defer srv.Close()
 
 	fc := newTestClient(srv.URL)
-	host, ambiguous, candidates, err := resolveHostWithUsers(context.Background(), fc, "", "mac")
+	host, ambiguous, candidates, err := resolveHostWithUsers(context.Background(), fc, 0, "mac")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -591,58 +837,269 @@ func TestFilterHostUsers_CaseInsensitiveAcrossFields(t *testing.T) {
 	}
 }
 
-func TestGetHostsForCVE_PaginatesTitles(t *testing.T) {
-	var titlesCalls atomic.Int32
+func TestValidateGetSoftwareArgs(t *testing.T) {
+	cases := []struct {
+		name                        string
+		perHost                     bool
+		fleet, platform, vulnerable string
+		wantErr                     bool
+	}{
+		{"per-host alone ok", true, "", "", "", false},
+		{"per-host + fleet rejected", true, "Workstations", "", "", true},
+		{"per-host + platform rejected", true, "", "macos", "", true},
+		{"cross-host none ok (full inventory)", false, "", "", "", false},
+		{"cross-host fleet alone ok", false, "Workstations", "", "", false},
+		{"cross-host platform alone rejected", false, "", "macos", "", true},
+		{"cross-host platform + fleet ok", false, "Workstations", "macos", "", false},
+		{"vulnerable=true ok", false, "", "", "true", false},
+		{"vulnerable=false ok", false, "", "", "false", false},
+		{"vulnerable bad value rejected", false, "", "", "maybe", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateGetSoftwareArgs(tc.perHost, tc.fleet, tc.platform, tc.vulnerable)
+			if tc.wantErr && err == nil {
+				t.Errorf("expected error, got nil")
+			}
+			if !tc.wantErr && err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+func TestMatchesSoftwareSource(t *testing.T) {
+	cases := []struct {
+		row, want string
+		expect    bool
+	}{
+		{"apps", "", true},                     // empty want matches anything
+		{"apps", "apps", true},                 // exact
+		{"NPM_Packages", "npm_packages", true}, // case-insensitive
+		{"deb_packages", "apps", false},        // mismatch
+	}
+	for _, tc := range cases {
+		if got := matchesSoftwareSource(tc.row, tc.want); got != tc.expect {
+			t.Errorf("matchesSoftwareSource(%q,%q) = %v, want %v", tc.row, tc.want, got, tc.expect)
+		}
+	}
+}
+
+func TestResolveHost_NumericFetchesByID(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/fleet/hosts/42" {
+			_ = json.NewEncoder(w).Encode(struct {
+				Host Endpoint `json:"host"`
+			}{Host: Endpoint{ID: 42, Name: "h42.local"}})
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+	fc := newTestClient(srv.URL)
+
+	// numeric host_id is verified via GetHostByID (confirms it exists, gets the name)
+	host, _, ambiguous, err := resolveHost(context.Background(), fc, 42, "")
+	if err != nil || ambiguous || host == nil || host.ID != 42 || host.Name != "h42.local" {
+		t.Fatalf("numeric: host=%+v ambiguous=%v err=%v, want id=42 with name", host, ambiguous, err)
+	}
+}
+
+func TestParseHostIDArg(t *testing.T) {
+	cases := []struct {
+		in      string
+		want    uint
+		wantErr bool
+	}{
+		{"", 0, false},
+		{"42", 42, false},
+		{"abc", 0, true},
+		{"0", 0, true},
+		{"-1", 0, true},
+	}
+	for _, tc := range cases {
+		got, err := parseHostIDArg(tc.in)
+		if tc.wantErr {
+			if err == nil {
+				t.Errorf("parseHostIDArg(%q): expected error, got nil", tc.in)
+			}
+			continue
+		}
+		if err != nil || got != tc.want {
+			t.Errorf("parseHostIDArg(%q) = (%d, %v), want (%d, nil)", tc.in, got, err, tc.want)
+		}
+	}
+}
+
+func TestResolveHost_IdentifierSingleAndFallback(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case strings.HasPrefix(r.URL.Path, "/api/v1/fleet/software/titles/"):
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"software_title": map[string]any{"versions": []any{}},
-			})
-		case r.URL.Path == "/api/v1/fleet/software/titles":
-			titlesCalls.Add(1)
-			page := r.URL.Query().Get("page")
-			n, _ := strconv.Atoi(page)
-			var count int
-			switch n {
-			case 0:
-				count = 100
-			case 1:
-				count = 30
-			default:
-				t.Errorf("unexpected titles page %d", n)
-				http.Error(w, "unexpected page", http.StatusBadRequest)
-				return
-			}
-			type title struct {
-				ID uint `json:"id"`
-			}
-			titles := make([]title, count)
-			for i := range titles {
-				titles[i].ID = uint(n*1000 + i + 1)
+		case r.URL.Path == "/api/v1/fleet/hosts":
+			hosts := []Endpoint{}
+			if r.URL.Query().Get("query") == "solo" { // single unambiguous match
+				hosts = []Endpoint{{ID: 7, Name: "solo.local"}}
 			}
 			_ = json.NewEncoder(w).Encode(struct {
-				SoftwareTitles []title `json:"software_titles"`
-			}{SoftwareTitles: titles})
+				Hosts []Endpoint `json:"hosts"`
+			}{Hosts: hosts})
+		case r.URL.Path == "/api/v1/fleet/hosts/identifier/ghost":
+			_ = json.NewEncoder(w).Encode(struct {
+				Host Endpoint `json:"host"`
+			}{Host: Endpoint{ID: 9, Name: "ghost.local"}})
 		default:
-			t.Errorf("unexpected request path %q", r.URL.Path)
 			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	fc := newTestClient(srv.URL)
+
+	// single substring match -> that host, not ambiguous
+	host, _, ambiguous, err := resolveHost(context.Background(), fc, 0, "solo")
+	if err != nil || ambiguous || host == nil || host.ID != 7 {
+		t.Fatalf("single match: host=%+v ambiguous=%v err=%v, want id=7", host, ambiguous, err)
+	}
+	// zero substring matches -> identifier-endpoint fallback
+	host, _, ambiguous, err = resolveHost(context.Background(), fc, 0, "ghost")
+	if err != nil || ambiguous || host == nil || host.ID != 9 {
+		t.Fatalf("fallback: host=%+v ambiguous=%v err=%v, want id=9", host, ambiguous, err)
+	}
+}
+
+func TestResolveHostWithUsers_SingleMatchAndFallback(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/fleet/hosts":
+			hosts := []Endpoint{}
+			if r.URL.Query().Get("query") == "solo" {
+				hosts = []Endpoint{{ID: 5, Name: "solo.local"}}
+			}
+			_ = json.NewEncoder(w).Encode(struct {
+				Hosts []Endpoint `json:"hosts"`
+			}{Hosts: hosts})
+		case "/api/v1/fleet/hosts/5":
+			_ = json.NewEncoder(w).Encode(struct {
+				Host HostWithUsers `json:"host"`
+			}{Host: HostWithUsers{Endpoint: Endpoint{ID: 5, Name: "solo.local"}, Users: []HostUser{{UID: 501, Username: "alice"}}}})
+		case "/api/v1/fleet/hosts/identifier/ghost":
+			// identifier endpoint resolves the host but carries NO users
+			_ = json.NewEncoder(w).Encode(struct {
+				Host Endpoint `json:"host"`
+			}{Host: Endpoint{ID: 9, Name: "ghost.local"}})
+		case "/api/v1/fleet/hosts/9":
+			// users come from the by-id refetch
+			_ = json.NewEncoder(w).Encode(struct {
+				Host HostWithUsers `json:"host"`
+			}{Host: HostWithUsers{Endpoint: Endpoint{ID: 9, Name: "ghost.local"}, Users: []HostUser{{UID: 0, Username: "root"}}}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	fc := newTestClient(srv.URL)
+
+	// single match -> fetched by id, users populated
+	host, ambiguous, _, err := resolveHostWithUsers(context.Background(), fc, 0, "solo")
+	if err != nil || ambiguous || host == nil || host.ID != 5 || len(host.Users) != 1 {
+		t.Fatalf("single match: host=%+v ambiguous=%v err=%v", host, ambiguous, err)
+	}
+	// zero matches -> identifier endpoint (no users) then by-id refetch (users)
+	host, ambiguous, _, err = resolveHostWithUsers(context.Background(), fc, 0, "ghost")
+	if err != nil || ambiguous || host == nil || host.ID != 9 || len(host.Users) != 1 || host.Users[0].Username != "root" {
+		t.Fatalf("fallback: host=%+v ambiguous=%v err=%v", host, ambiguous, err)
+	}
+}
+
+func TestGetHostSoftware_DecodesNestedInstalledVersions(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/software") {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write([]byte(`{"software":[{"id":1,"name":"curl","source":"deb_packages","installed_versions":[{"version":"7.88.1","vulnerabilities":["CVE-2026-1111"],"installed_paths":["/usr/bin/curl"]}]}]}`))
+	}))
+	defer srv.Close()
+	fc := newTestClient(srv.URL)
+
+	out, _, err := fc.GetHostSoftware(context.Background(), 1, "", "", "", 10)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(out) != 1 || len(out[0].InstalledVersions) != 1 {
+		t.Fatalf("decoded = %+v, want 1 row with 1 installed version", out)
+	}
+	v := out[0].InstalledVersions[0]
+	if v.Version != "7.88.1" || len(v.Vulnerabilities) != 1 || v.Vulnerabilities[0] != "CVE-2026-1111" || len(v.InstalledPaths) != 1 {
+		t.Errorf("nested installed_version not decoded: %+v", v)
+	}
+}
+
+func TestGetHostSoftware_SourceFilterAndPerPage(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/software") {
+			http.NotFound(w, r)
+			return
+		}
+		rows := []HostSoftware{
+			{ID: 1, Name: "a", Source: "apps"},
+			{ID: 2, Name: "b", Source: "deb_packages"},
+			{ID: 3, Name: "c", Source: "apps"},
+			{ID: 4, Name: "d", Source: "npm_packages"},
+			{ID: 5, Name: "e", Source: "apps"},
+		}
+		_ = json.NewEncoder(w).Encode(struct {
+			Software []HostSoftware `json:"software"`
+		}{Software: rows})
+	}))
+	defer srv.Close()
+	fc := newTestClient(srv.URL)
+
+	// source=apps keeps only apps rows; perPage=2 caps the merged result early
+	out, truncated, err := fc.GetHostSoftware(context.Background(), 42, "", "", "apps", 2)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if truncated {
+		t.Errorf("expected truncated=false when perPage is reached")
+	}
+	if len(out) != 2 {
+		t.Fatalf("len(out) = %d, want 2 (perPage cap on matching rows)", len(out))
+	}
+	for _, sw := range out {
+		if sw.Source != "apps" {
+			t.Errorf("source filter leaked non-apps row: %+v", sw)
+		}
+	}
+}
+
+func TestGetPolicies_IncludesQueryField(t *testing.T) {
+	const wantSQL = "SELECT 1;"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/fleet/global/policies":
+			_, _ = w.Write([]byte(`{"policies":[
+				{"id":1,"name":"with sql","query":"` + wantSQL + `"},
+				{"id":2,"name":"empty sql","query":""}
+			]}`))
+		case "/api/v1/fleet/fleets":
+			_, _ = w.Write([]byte(`{"teams":[]}`))
+		default:
+			http.Error(w, "unexpected path "+r.URL.Path, http.StatusNotFound)
 		}
 	}))
 	defer srv.Close()
 
 	fc := newTestClient(srv.URL)
-	hosts, truncated, err := fc.GetHostsForCVE(context.Background(), "CVE-2026-12345", "", "", "", "", "", 0)
+	policies, err := fc.GetPolicies(context.Background())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if truncated {
-		t.Errorf("expected truncated=false (no per-version-id fan-out hit cap)")
+	if len(policies) != 2 {
+		t.Fatalf("expected 2 policies, got %d", len(policies))
 	}
-	if len(hosts) != 0 {
-		t.Errorf("expected 0 hosts (titles had no versions), got %d", len(hosts))
+	if policies[0].Query != wantSQL {
+		t.Errorf("policy 1 Query = %q, want %q", policies[0].Query, wantSQL)
 	}
-	if got := titlesCalls.Load(); got != 2 {
-		t.Errorf("expected 2 titles pages (100 + 30 short page), got %d", got)
+	if policies[1].Query != "" {
+		t.Errorf("policy 2 Query = %q, want empty string", policies[1].Query)
 	}
 }

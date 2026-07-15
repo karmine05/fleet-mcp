@@ -19,7 +19,7 @@ type VettedQuery struct {
 	SQL         string `json:"sql"`
 }
 
-// vettedQueryLibrary contains queries sourced verbatim from the above repos.
+// vettedQueryLibrary contains queries sourced verbatim from the CIS benchmarks above.
 var vettedQueryLibrary = []VettedQuery{
 
 	// =========================================================================
