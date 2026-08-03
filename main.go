@@ -141,7 +141,7 @@ func main() {
 		Addr:              ":" + config.Port,
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       30 * time.Second,
+		ReadTimeout:       120 * time.Second,
 		WriteTimeout:      0, // SSE streams are long-lived; rely on idle/read timeouts
 		IdleTimeout:       120 * time.Second,
 	}
